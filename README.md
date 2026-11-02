@@ -1,8 +1,16 @@
 # DotCord
 
-A standalone Discord transport for MCP Events. DotCord forwards new messages from configured senders to separate consumers and provides scoped conversation context, image reads and destination-bound replies. It has its own HTTP endpoint and encrypted SQLite live state.
+DotCord is a standalone bridge for bringing **your [OpenAI dot](https://openai.com/index/introducing-dots/) into Discord**. It forwards new Discord messages to your dot through MCP Events and provides tools for your dot to read recent conversation context, view attached images and reply in the same Discord conversation.
 
-**Integration status:** this build accepts externally provisioned, per-sender bearer credentials. It does not include OAuth discovery, an authorization server or consumer provisioning. Direct ChatGPT use needs a compatible authorization integration; static API keys are not a supported ChatGPT sign-in method. See the [OpenAI authentication documentation](https://developers.openai.com/plugins/build/auth).
+## How the bridge works
+
+1. A configured person sends the bot a Discord DM, or mentions or replies to it in a server.
+2. DotCord delivers a `discord.message.created` event to that person's configured dot integration.
+3. Your dot can read the accepted conversation's recent context and supported images, then send a reply back to its original Discord destination.
+
+Each sender has a separate binding and encrypted live context. DotCord supplies the Discord connection; your dot supplies the assistant response. The receiving dot integration must keep each person's account, memory and tools isolated.
+
+**Connection requirement:** this build accepts externally provisioned, per-sender bearer credentials. It does not include OAuth discovery, an authorization server or dot connector provisioning. Connecting your dot requires a compatible authorization integration; static API keys are not a supported ChatGPT sign-in method. The complete dot-to-Discord connection still needs live verification. See the [OpenAI authentication documentation](https://developers.openai.com/plugins/build/auth).
 
 ## Quick start
 
