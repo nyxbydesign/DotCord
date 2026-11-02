@@ -2,6 +2,16 @@
   "name": "dotcord",
   "version": "0.1.0",
   "private": true,
+  "description": "Standalone Discord transport for MCP Events with sender-scoped context and ordered replies.",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nyxbydesign/DotCord.git"
+  },
+  "homepage": "https://github.com/nyxbydesign/DotCord#readme",
+  "bugs": {
+    "url": "https://github.com/nyxbydesign/DotCord/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=22.13.0"

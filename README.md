@@ -103,3 +103,11 @@ A cutover can miss messages because historical replay is unavailable. Local test
 `npm run build` compiles only `src/`. `npm test` exercises synthetic HTTP/MCP, callback, storage, sender-isolation, attachment and ordered-reply boundaries. Provider and end-to-end consumer acceptance need separate live checks.
 
 Runtime dependencies are `zod`, `undici` and `@napi-rs/canvas`; TypeScript and Node types are development dependencies. Exact versions and package integrity are recorded in `package-lock.json`. Third-party packages retain their own licenses; no dependency source or binaries are vendored here.
+
+## License
+
+Copyright (C) 2026 Nyx.
+
+DotCord is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License, version 3 only (`GPL-3.0-only`), as published by the Free Software Foundation. No later version is granted.
+
+DotCord is distributed without any warranty, including the implied warranties of merchantability or fitness for a particular purpose. See [LICENSE](LICENSE) for the full terms. Third-party dependencies retain their own licenses and notices.
