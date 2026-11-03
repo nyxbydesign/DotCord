@@ -24,19 +24,19 @@ export type EventPayload = {
 };
 type Event = { eventId: string; name: string; timestamp: string; data: EventPayload; cursor: null };
 export type MessageRecord = {
-  event: Event; expires: number; principal: string; generation: string;
+  event: Event; expires: number; principal: string; generation: string; authority?: string;
   delivery: { status: "queued" | "receipt" | "failed"; attempts: number; next: number };
   reply?: { status: "pending" | "sent"; hash: string; messageId?: string; text?: string; messageIds?: string[] };
   timing?: { trace: string; receivedAt: number; admittedAt: number; dispatchAt?: number; receiptAt?: number;
     firstToolAt?: number; replyRequestedAt?: number; replyDispatchAt?: number; replySentAt?: number };
 };
 type ConversationRecord = {
-  author: string; channel: string; participants: string[]; expires: number;
+  author: string; channel: string; participants: string[]; expires: number; generation: string;
   turns: Array<{ message_id: string; role: "user" | "assistant"; text: string; timestamp: string; image_message?: true }>;
 };
 export type Subscription = {
   id: string; principal: string; url: string; secret: string; expires: number; authorizedUntil: number;
-  active: boolean; verifiedUntil: number; generation: string; oldSecret?: string; rotateUntil?: number;
+  active: boolean; verifiedUntil: number; generation: string; authority?: string; oldSecret?: string; rotateUntil?: number;
   audience: BridgeConfig["audience"];
 };
 const subscriptionSchema = z.object({
@@ -49,7 +49,7 @@ const replySchema = z.object({ message_id: snowflake, conversation_id: z.string(
 export class BridgeError extends Error {
   constructor(readonly code: number, message: string, readonly reason = message) { super(message); }
 }
-export type AccessCheck = (principal: string) => Promise<boolean>;
+export type AccessCheck = (principal: string, authority?: string) => Promise<boolean>;
 
 export class DiscordEventsBridge {
   private tail: Promise<unknown> = Promise.resolve();
@@ -68,18 +68,19 @@ export class DiscordEventsBridge {
     readonly config: BridgeConfig, private readonly records: BridgeRecords,
     private readonly post: CallbackPost, private readonly send: ReplySend,
     private readonly access: AccessCheck, private readonly log: (code: string) => void,
-    private readonly now = Date.now, typing?: TypingRequest, private readonly readImage?: AttachmentReader
+    private readonly now = Date.now, typing?: TypingRequest, private readonly readImage?: AttachmentReader,
+    private readonly controls: BridgeRecords = records, private readonly intakeAllowed: () => boolean = () => true
   ) {
     this.startedAt = now();
     if (typing) this.typing = new DiscordTyping(typing, async () => {
-      const sub = (await this.records.get<Subscription>("subscription", "dot"))?.value;
+      const sub = (await this.controls.get<Subscription>("subscription", "dot"))?.value;
       return this.config.enabled && this.healthy && !this.stopped && Boolean(sub?.active
         && sub.audience === this.config.audience && sub.expires > this.now() && sub.authorizedUntil > this.now()
-        && await this.access(sub.principal));
+        && this.intakeAllowed() && await this.access(sub.principal, sub.authority));
     }, log, now);
   }
 
-  status() { return { enabled: this.config.enabled, healthy: this.healthy, stopped: this.stopped, audience: this.config.audience,
+  status() { return { enabled: this.config.enabled, intakeEnabled:this.intakeAllowed(), healthy: this.healthy, stopped: this.stopped, audience: this.config.audience,
     queuedOperations: this.pending, pendingDeliveries: this.deliveries, pendingReplies: this.writes.size, pendingAttachmentReads: this.imageReads.size }; }
   stop() { this.stopped = true; this.typing?.close(); this.imageAbort.abort(); }
   async drain() {
@@ -122,11 +123,11 @@ export class DiscordEventsBridge {
     return work;
   }
   private async put<T>(type: string, key: string, value: T, etag: string | null, expires?: number) {
-    try { return await this.records.put(type, key, value, etag, expires); }
+    try { return await (type === "subscription" ? this.controls : this.records).put(type, key, value, etag, expires); }
     catch { this.healthy = false; this.typing?.clear(); throw new BridgeError(-32603, "storage_uncertain_stop_and_reconcile"); }
   }
-  private async authorize(principal: string): Promise<void> {
-    if (!this.config.enabled || !this.healthy || this.stopped || !await this.access(principal)) throw new BridgeError(-32024, "forbidden");
+  private async authorize(principal: string, authority?: string): Promise<void> {
+    if (!this.config.enabled || !this.healthy || this.stopped || !await this.access(principal, authority)) throw new BridgeError(-32024, "forbidden");
   }
   private identity(input: unknown) {
     const parsed = subscriptionSchema.safeParse(input);
@@ -142,22 +143,22 @@ export class DiscordEventsBridge {
     if (sub.oldSecret && (sub.rotateUntil ?? 0) > this.now()) keys.push(sub.oldSecret);
     return { "webhook-id": id, "webhook-timestamp": timestamp, "webhook-signature": keys.map((key) => signature(key, id, timestamp, body)).join(" "), "X-MCP-Subscription-Id": sub.id };
   }
-  subscribe(principal: string, input: unknown, authorizedUntil: number) { return this.serial(async () => {
-    await this.authorize(principal);
+  subscribe(principal: string, input: unknown, authorizedUntil: number, authority?: string) { return this.serial(async () => {
+    await this.authorize(principal, authority);
     const params = this.identity(input);
     if (!params.delivery.secret || !Number.isFinite(authorizedUntil) || authorizedUntil <= this.now()) throw new BridgeError(-32602, "invalid_parameters");
     try { signingKey(params.delivery.secret); } catch { throw new BridgeError(-32602, "invalid_signing_secret"); }
     const id = "sub_" + hash(JSON.stringify([principal, params.delivery.url, EVENT_NAME, { audience: params.arguments.audience }]));
-    const old = await this.records.get<Subscription>("subscription", "dot");
+    const old = await this.controls.get<Subscription>("subscription", "dot");
     // An unsubscribe retains the destination binding. Moving dots requires an explicit operator migration.
     if (old && (old.value.principal !== principal || old.value.url !== params.delivery.url
       || old.value.active && old.value.id !== id)) throw new BridgeError(-32024, "different_dot_binding");
     const previous = old?.value;
     const sub: Subscription = {
-      id, principal, audience: this.config.audience, url: params.delivery.url, secret: params.delivery.secret, authorizedUntil,
+      id, principal, authority, audience: this.config.audience, url: params.delivery.url, secret: params.delivery.secret, authorizedUntil,
       expires: Math.min(this.now() + Math.min(params.ttlMs ?? DAY, DAY), authorizedUntil), active: true,
-      verifiedUntil: previous?.verifiedUntil ?? 0,
-      generation: previous?.active && previous.expires > this.now() ? previous.generation : randomBytes(16).toString("hex")
+      verifiedUntil: previous?.authority === authority ? previous?.verifiedUntil ?? 0 : 0,
+      generation: previous?.active && previous.expires > this.now() && previous.authority === authority ? previous.generation : randomBytes(16).toString("hex")
     };
     if (previous && previous.secret !== sub.secret) { sub.oldSecret = previous.secret; sub.rotateUntil = this.now() + 300_000; }
     else if (previous?.oldSecret && (previous.rotateUntil ?? 0) > this.now()) { sub.oldSecret = previous.oldSecret; sub.rotateUntil = previous.rotateUntil; }
@@ -172,7 +173,7 @@ export class DiscordEventsBridge {
       } catch { throw new BridgeError(-32015, "challenge_failed"); }
       sub.verifiedUntil = this.now() + 300_000;
     }
-    await this.authorize(principal);
+    await this.authorize(principal, authority);
     await this.put("subscription", "dot", sub, old?.etag ?? null);
     if (previous?.generation !== sub.generation) this.typing?.clear();
     this.log("subscription_active");
@@ -181,7 +182,7 @@ export class DiscordEventsBridge {
   unsubscribe(principal: string, input: unknown) { return this.serial(async () => {
     await this.authorize(principal);
     const params = this.identity(input);
-    const old = await this.records.get<Subscription>("subscription", "dot");
+    const old = await this.controls.get<Subscription>("subscription", "dot");
     if (old && (old.value.principal !== principal || old.value.url !== params.delivery.url)) throw new BridgeError(-32024, "forbidden");
     if (old) await this.put("subscription", "dot", { ...old.value, active: false, secret: "", oldSecret: undefined }, old.etag);
     this.typing?.clear();
@@ -213,7 +214,7 @@ export class DiscordEventsBridge {
     const receivedAt = this.now();
     return this.serial(async () => {
       const parsed = incomingSchema.safeParse(input);
-      if (!parsed.success || !this.config.enabled || !this.healthy || this.stopped) return false;
+      if (!parsed.success || !this.config.enabled || !this.healthy || this.stopped || !this.intakeAllowed()) return false;
       const m = parsed.data;
       if (m.author.id !== this.config.senderUserId) return false;
       if (m.webhook_id !== undefined || m.author.bot || m.author.id === this.config.botUserId || (m.type !== undefined && ![0, 19].includes(m.type))) return false;
@@ -223,9 +224,9 @@ export class DiscordEventsBridge {
       const occurred = Date.parse(m.timestamp);
       const attachments = imageAttachments(m.attachments ?? []);
       if (occurred < Math.max(this.startedAt, this.now() - 60_000) || occurred > this.now() + 60_000 || (!m.content.trim() && !attachments.length)) return false;
-      const sub = await this.records.get<Subscription>("subscription", "dot");
+      const sub = await this.controls.get<Subscription>("subscription", "dot");
       if (!sub?.value.active || sub.value.audience !== this.config.audience || sub.value.expires <= this.now() || sub.value.authorizedUntil <= this.now()) return false;
-      await this.authorize(sub.value.principal);
+      await this.authorize(sub.value.principal, sub.value.authority);
       if (await this.records.get("message", m.id)) return false;
       const messages = await this.records.list("message", 1000);
       if (messages.length >= 1000 || messages.filter(({ queued }) => queued).length >= 100) throw new BridgeError(-32000, "capacity_reached");
@@ -234,7 +235,7 @@ export class DiscordEventsBridge {
       const conversation = "conv_" + hash(JSON.stringify([m.guild_id ?? null, m.channel_id, participants]));
       if (!await this.records.get("conversation", conversation) && (await this.records.list("conversation", 1000)).length >= 1000) throw new BridgeError(-32000, "conversation_capacity_reached");
       const value: MessageRecord = {
-        principal: sub.value.principal, generation: sub.value.generation, expires: this.now() + DAY,
+        principal: sub.value.principal, generation: sub.value.generation, authority: sub.value.authority, expires: this.now() + DAY,
         timing: { trace: randomBytes(12).toString("hex"), receivedAt, admittedAt: this.now() },
         delivery: { status: "queued", attempts: 0, next: this.now() },
         event: { eventId: "discord_" + m.id, name: EVENT_NAME, timestamp: new Date(occurred).toISOString(), cursor: null,
@@ -258,20 +259,20 @@ export class DiscordEventsBridge {
   }
   private async deliver(prune: boolean) {
     const job = await this.serial(async () => {
-      if (!this.config.enabled || !this.healthy || this.stopped) { this.typing?.clear(); return; }
+      if (!this.config.enabled || !this.healthy || this.stopped || !this.intakeAllowed()) { this.typing?.clear(); return; }
       const messages = await this.records.list("message", 1000);
       if (prune) for (const record of messages) if ((record.expires ?? Infinity) <= this.now()) await this.records.delete("message", record.key);
       if (prune) for (const type of ["rate", "conversation"]) {
         for (const record of await this.records.list(type, 1000)) if ((record.expires ?? Infinity) <= this.now()) await this.records.delete(type, record.key);
       }
-      let storedSub = await this.records.get<Subscription>("subscription", "dot");
+      let storedSub = await this.controls.get<Subscription>("subscription", "dot");
       let sub = storedSub?.value;
       if (!sub?.active) { this.typing?.clear(); return; }
       if (sub.oldSecret && (sub.rotateUntil ?? 0) <= this.now()) {
         storedSub = await this.put("subscription", "dot", { ...sub, oldSecret: undefined, rotateUntil: undefined }, storedSub!.etag);
         sub = storedSub.value;
       }
-      if (sub.audience !== this.config.audience || sub.expires <= this.now() || sub.authorizedUntil <= this.now() || !await this.access(sub.principal)) {
+      if (sub.audience !== this.config.audience || sub.expires <= this.now() || sub.authorizedUntil <= this.now() || !await this.access(sub.principal, sub.authority)) {
         await this.put("subscription", "dot", { ...sub, active: false, secret: "", oldSecret: undefined }, storedSub!.etag);
         this.typing?.clear();
         this.log("subscription_expired_or_revoked"); return;
@@ -292,7 +293,7 @@ export class DiscordEventsBridge {
       const storedMessage = await this.records.get<MessageRecord>("message", summary.key);
       if (!storedMessage) return;
       const value = structuredClone(storedMessage.value);
-      if (value.generation !== sub.generation || value.principal !== sub.principal || value.delivery.attempts >= 5) {
+      if (value.generation !== sub.generation || value.authority !== sub.authority || value.principal !== sub.principal || value.delivery.attempts >= 5) {
         value.delivery.status = "failed";
         this.typing?.stop(summary.key);
         await this.put("message", summary.key, value, storedMessage.etag, value.expires); return;
@@ -303,7 +304,7 @@ export class DiscordEventsBridge {
       await this.put("message", summary.key, value, storedMessage.etag, value.expires);
       return { key: summary.key, value, sub };
     });
-    if (!job || this.stopped || !this.healthy) return;
+    if (!job || this.stopped || !this.healthy || !await this.access(job.sub.principal, job.sub.authority)) return;
     const { value, sub } = job;
     const body = JSON.stringify(value.event);
     this.trace(value, "dispatch");
@@ -322,7 +323,7 @@ export class DiscordEventsBridge {
       const merged = { ...current.value, delivery: value.delivery };
       if (merged.timing && value.delivery.status === "receipt") merged.timing.receiptAt = receiptAt;
       if (response.status === 410) {
-        const active = await this.records.get<Subscription>("subscription", "dot");
+        const active = await this.controls.get<Subscription>("subscription", "dot");
         if (active?.value.generation === sub.generation && active.value.id === sub.id) {
           await this.put("subscription", "dot", { ...active.value, active: false, secret: "", oldSecret: undefined }, active.etag);
           this.typing?.clear();
@@ -341,6 +342,7 @@ export class DiscordEventsBridge {
     return this.replyBatch(principal, { ...anchor, texts: [text] }).then(result => ({ message_id: result.message_ids[0]!, duplicate: result.duplicate }));
   }
   replyBatch(principal: string, input: unknown) {
+    if (!this.intakeAllowed()) return Promise.reject(new BridgeError(-32024,"intake_disabled"));
     const parsed = replySchema.omit({ text: true }).extend({ texts: z.array(z.string().trim().min(1).max(2000)).min(1).max(4) }).safeParse(input);
     if (!parsed.success) return Promise.reject(new BridgeError(-32602,"invalid_parameters"));
     const p = parsed.data, requestedAt = this.now(), contentHash = hash(JSON.stringify(p.texts));
@@ -349,13 +351,13 @@ export class DiscordEventsBridge {
       const prepared = await this.serial(async () => {
         await this.authorize(principal);
         const record = await this.records.get<MessageRecord>("message",p.message_id);
-        const sub = await this.records.get<Subscription>("subscription","dot");
+        const sub = await this.controls.get<Subscription>("subscription","dot");
         const value = record?.value;
         if (!value || value.principal !== principal || value.event.data.author_id !== this.config.senderUserId
           || value.expires <= this.now() || value.event.data.conversation_id !== p.conversation_id
           || !sub?.value.active || sub.value.principal !== principal || sub.value.authorizedUntil <= this.now()
           || sub.value.audience !== this.config.audience || sub.value.expires <= this.now()
-          || sub.value.generation !== value.generation || value.delivery.attempts < 1) throw new BridgeError(-32024,"unknown_or_expired_message");
+          || sub.value.generation !== value.generation || sub.value.authority !== value.authority || !await this.access(principal, value.authority) || value.delivery.attempts < 1) throw new BridgeError(-32024,"unknown_or_expired_message");
         if (value.reply) {
           if (value.reply.hash !== contentHash) throw new BridgeError(-32024,"reply_already_reserved");
           if (value.reply.status === "pending") throw new BridgeError(-32024,"reply_outcome_uncertain_no_resend");
@@ -378,8 +380,8 @@ export class DiscordEventsBridge {
       try {
         for (let index=0; index<p.texts.length; index++) {
           await this.serial(async () => {
-            await this.authorize(principal);
-            const active=(await this.records.get<Subscription>("subscription","dot"))?.value;
+            await this.authorize(principal, value.authority);
+            const active=(await this.controls.get<Subscription>("subscription","dot"))?.value;
             if (!active?.active || active.principal !== principal || active.generation !== value.generation
               || active.audience !== this.config.audience || active.expires <= this.now()
               || active.authorizedUntil <= this.now() || value.expires <= this.now()) throw new BridgeError(-32024,"unknown_or_expired_message");
@@ -420,13 +422,14 @@ export class DiscordEventsBridge {
     }));
   }
   private async attachmentBinding(principal: string, p: { message_id: string; conversation_id: string; attachment_id: string }) {
+    if (!this.intakeAllowed()) throw new BridgeError(-32024,"intake_disabled");
     await this.authorize(principal);
     const record = await this.records.get<MessageRecord>("message", p.message_id);
-    const sub = (await this.records.get<Subscription>("subscription", "dot"))?.value;
+    const sub = (await this.controls.get<Subscription>("subscription", "dot"))?.value;
     const value = record?.value;
     if (!value || value.event.data.author_id !== this.config.senderUserId || value.principal !== principal || value.expires <= this.now() || value.event.data.conversation_id !== p.conversation_id
       || value.delivery.attempts < 1 || !sub?.active || sub.audience !== this.config.audience || sub.expires <= this.now()
-      || sub.authorizedUntil <= this.now() || sub.generation !== value.generation || sub.principal !== principal) {
+      || sub.authorizedUntil <= this.now() || sub.generation !== value.generation || sub.authority !== value.authority || !await this.access(principal,value.authority) || sub.principal !== principal) {
       throw new BridgeError(-32024, "unknown_or_expired_message");
     }
     const attachment = value.event.data.attachments?.find(item => item.id === p.attachment_id);
@@ -474,8 +477,8 @@ export class DiscordEventsBridge {
   private async appendConversation(message: MessageRecord, role: "user" | "assistant", id: string, text: string, timestamp: string) {
     const data = message.event.data;
     const old = await this.records.get<ConversationRecord>("conversation", data.conversation_id);
-    const value: ConversationRecord = old && old.value.expires > this.now() ? old.value : {
-      author: data.author_id, channel: data.channel_id, participants: data.participant_ids, expires: 0, turns: []
+    const value: ConversationRecord = old && old.value.expires > this.now() && old.value.generation === message.generation ? old.value : {
+      author: data.author_id, channel: data.channel_id, participants: data.participant_ids, expires: 0, generation:message.generation, turns: []
     };
     if (value.author !== data.author_id || value.channel !== data.channel_id) throw new BridgeError(-32024, "conversation_scope_mismatch");
     if (!value.turns.some((turn) => turn.message_id === id && turn.role === role)) value.turns.push({ message_id: id, role, text, timestamp, ...(role === "user" && data.attachments?.length ? { image_message: true as const } : {}) });
@@ -484,6 +487,7 @@ export class DiscordEventsBridge {
     await this.put("conversation", data.conversation_id, value, old?.etag ?? null, value.expires);
   }
   conversation(principal: string, input: unknown) {
+    if (!this.intakeAllowed()) return Promise.reject(new BridgeError(-32024,"intake_disabled"));
     const requestedAt = this.now();
     return this.serial(async () => {
       await this.authorize(principal);
@@ -491,10 +495,11 @@ export class DiscordEventsBridge {
       if (!parsed.success) throw new BridgeError(-32602, "invalid_parameters");
       const p = parsed.data;
       const anchor = await this.records.get<MessageRecord>("message", p.message_id);
-      const sub = await this.records.get<Subscription>("subscription", "dot");
+      const sub = await this.controls.get<Subscription>("subscription", "dot");
       if (!anchor || anchor.value.event.data.author_id !== this.config.senderUserId || anchor.value.principal !== principal || anchor.value.expires <= this.now()
         || anchor.value.event.data.conversation_id !== p.conversation_id || !sub?.value.active
-        || sub.value.audience !== this.config.audience || sub.value.expires <= this.now() || anchor.value.generation !== sub.value.generation) throw new BridgeError(-32024, "unknown_or_expired_message");
+        || sub.value.audience !== this.config.audience || sub.value.expires <= this.now() || sub.value.authorizedUntil <= this.now()
+        || anchor.value.generation !== sub.value.generation || anchor.value.authority !== sub.value.authority || !await this.access(principal,anchor.value.authority)) throw new BridgeError(-32024, "unknown_or_expired_message");
       if (anchor.value.timing && anchor.value.timing.firstToolAt === undefined) {
         anchor.value.timing.firstToolAt = requestedAt;
         await this.put("message", p.message_id, anchor.value, anchor.etag, anchor.value.expires);

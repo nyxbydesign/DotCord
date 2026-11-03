@@ -10,11 +10,33 @@ DotCord is a standalone bridge for bringing **your [OpenAI dot](https://openai.c
 
 Each sender has a separate binding and encrypted live context. DotCord supplies the Discord connection; your dot supplies the assistant response. The receiving dot integration must keep each person's account, memory and tools isolated.
 
-**Connection requirement:** this build accepts externally provisioned, per-sender bearer credentials. It does not include OAuth discovery, an authorization server or dot connector provisioning. Connecting your dot requires a compatible authorization integration; static API keys are not a supported ChatGPT sign-in method. The complete dot-to-Discord connection still needs live verification. See the [OpenAI authentication documentation](https://developers.openai.com/plugins/build/auth).
+**Connection requirement:** ChatGPT connections use the self-hosted OAuth issuer described below. The legacy externally provisioned bearer configuration is available for separate compatible consumers; it is never a fallback after an OAuth failure. A configured and tested local issuer still requires a real account link, signed subscription challenge and Discord reply witness before the complete connection is ready. See the [OpenAI authentication documentation](https://developers.openai.com/plugins/build/auth).
+
+## OAuth setup
+
+Use [config.oauth.example.json](config.oauth.example.json) for an owner-DM connection. Configure the dedicated Discord login application's `identify` scope and redirect to `https://your-host/oauth/login/discord/callback`. Its client ID/secret are separate from both the existing Discord bot token and the public ChatGPT client. Register the exact ChatGPT OAuth redirect shown by the connection's management page; do not guess a callback ID or reuse an event webhook URL as the OAuth redirect.
+
+Keep the auth-state AES key, session-cookie key and ES256/P-256 signing JWK or JWKS in separate private external files. AES/cookie files contain canonical base64 encoding of 32 bytes. The signing key must have an explicit unique `kid`; the first key is the current private signing key. Public JWKS responses omit private material. Credential files must satisfy the ownership and non-symlink rules below. There are no generated development keys or permissive login screens.
+
+Start authentication without Discord intake:
+
+```sh
+DOTCORD_CONFIG=/etc/dotcord/config.json DOTCORD_AUTH_ENABLED=1 npm start
+```
+
+This opens only the authentication/control store. It does not read the bot token or message-state key, open the message database, call Discord's bot API, or start a Gateway. Discord login uses its separate bounded, source-bound HTTPS client. Enable `DOTCORD_NETWORK_ENABLED=1` separately only when the bot, sender, callback and message-state custody are ready.
+
+The issuer is `<publicOrigin>/oauth`; discovery is `/oauth/.well-known/openid-configuration`. Protected-resource metadata is `/.well-known/oauth-protected-resource/mcp`, and access tokens target `<publicOrigin>/mcp`. The predefined ChatGPT public client uses authorization code with S256 PKCE and `token_endpoint_auth_method=none`. Dynamic registration, CIMD, password, implicit and client-credentials grants are disabled. The minimal OIDC identity contains only an opaque subject; verified-email workspace restrictions require a separate compatible identity configuration.
+
+The five resource scopes are `discord:status`, `discord:context:read`, `discord:attachments:read`, `discord:reply` and `discord:events:subscribe`. Access tokens last at most five minutes. Sender authorization lasts at most 24 hours from consent and never beyond `authorizedUntil`. Refresh rotates without extending that cutoff; reuse revokes its grant. A new grant generation cannot replay old anchors or queued events or bypass an unresolved send barrier. Changing `grantVersion` is an explicit operator action, not an automatic renewal.
+
+Event callbacks need separate exact-URL approval. A fixed `callbackUrl` may be configured in the binding. If the URL is learned during subscription, the request records a pending encrypted enrollment and returns `callback_approval_required` without sending a challenge or application data. The private `callbackApprovalFile` must contain `callbackUrl`, the current `grantId` and numeric `grantVersion`; keep it under the same private-file rules. Subscription creation then verifies its fresh signed challenge. OAuth redirect URLs and MCP Events callbacks are distinct.
+
+Authorization state, codes, refresh families, enrollments and subscription secrets are encrypted in the separate auth store. Message/context/send-barrier state uses a stable `live-v2` installation identity and a different key. Existing nonmatching state refuses to open; do not delete it to force a migration. Keep database/key pairs together for recovery. Audit metadata contains only bounded operation codes and pseudonymous grant references and expires after seven days; request bodies and credentials are not logged.
 
 ## Quick start
 
-Use Node.js 22.13 or later and a platform supported by `@napi-rs/canvas`.
+Use Node.js 24 or later and a platform supported by `@napi-rs/canvas`.
 
 ```sh
 npm ci --ignore-scripts

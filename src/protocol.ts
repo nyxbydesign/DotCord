@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { BridgeError, DiscordEventsBridge, EVENT_NAME } from "./bridge.js";
 import { MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS, MAX_MESSAGE_IMAGES } from "./attachments.js";
+import { requiredScopes } from "./oauth.js";
 
 const objectSchema = (properties: object, required: string[]) => ({ type: "object", properties, required, additionalProperties: false });
 export const replyTool = {
@@ -33,7 +34,7 @@ const imageDescriptor = objectSchema({ id: { type: "string" }, filename: { type:
 }, ["id", "filename", "mime_type", "size"]);
 const connectionTool = {
   name: "discord_connection_status",
-  description: "Check this account's Discord authorization before subscribing. Requires discord:reply and can prompt for that grant. Reads no messages, sends nothing, and does not create a subscription.",
+  description: "Check this account's authorization and whether Discord intake is enabled. Requires discord:status. Reads no messages, sends nothing, and does not create a subscription.",
   inputSchema: objectSchema({}, []),
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
 };
@@ -50,7 +51,7 @@ export function eventDefinition(audience: "owner-dm" | "directed") {
   };
 }
 const requestSchema = z.object({
-  principal: z.string().min(1).max(4096), authorizedUntil: z.number().finite(),
+  principal: z.string().min(1).max(4096), authorizedUntil: z.number().finite(), authority: z.string().max(200).optional(),
   headers: z.record(z.string(), z.string()),
   rpc: z.object({ jsonrpc: z.literal("2.0"), id: z.union([z.string().max(200), z.number().finite()]), method: z.string().max(100), params: z.record(z.string(), z.unknown()) })
 });
@@ -81,7 +82,7 @@ export async function bridgeProtocol(bridge: DiscordEventsBridge, input: unknown
   try {
     const parsed = requestSchema.safeParse(input);
     if (!parsed.success) throw new BridgeError(-32600, "invalid_request");
-    const { rpc, principal, authorizedUntil, headers } = parsed.data;
+    const { rpc, principal, authorizedUntil, authority, headers } = parsed.data;
     id = rpc.id;
     if (rpc.method === "events/subscribe") {
       let destination: SubscriptionDiagnostic["destination"] = "other";
@@ -111,13 +112,14 @@ export async function bridgeProtocol(bridge: DiscordEventsBridge, input: unknown
         _meta: { "io.modelcontextprotocol/serverInfo": { name: "DotCord", version: "1.0.0" } } }; break;
       case "ping": result = { resultType: "complete" }; break;
       case "events/list": result = { events: [eventDefinition(bridge.config.audience)] }; break;
-      case "tools/list": result = { resultType: "complete", tools: [conversationTool, replyTool, batchTool, connectionTool, attachmentTool] }; break;
-      case "events/subscribe": result = await bridge.subscribe(principal, params, authorizedUntil); break;
+      case "tools/list": result = { resultType: "complete", tools: [conversationTool, replyTool, batchTool, connectionTool, attachmentTool].map(tool=>({...tool,
+        _meta:{securitySchemes:[{type:"oauth2",scopes:requiredScopes("tools/call",tool.name)}]}})) }; break;
+      case "events/subscribe": result = await bridge.subscribe(principal, params, authorizedUntil, authority); break;
       case "events/unsubscribe": result = await bridge.unsubscribe(principal, params); break;
       case "tools/call": {
         if (params.name === connectionTool.name) {
           if (!z.object({}).strict().safeParse(params.arguments).success) throw new BridgeError(-32602, "invalid_arguments");
-          result = { resultType: "complete", content: [{ type: "text", text: JSON.stringify({ authorized: true, audience: bridge.config.audience }) }], isError: false }; break;
+          result = { resultType: "complete", content: [{ type: "text", text: JSON.stringify({ authorized: true, audience: bridge.config.audience, intakeEnabled:bridge.status().intakeEnabled }) }], isError: false }; break;
         }
         if (params.name === attachmentTool.name) {
           const image = await bridge.attachment(principal, params.arguments);
