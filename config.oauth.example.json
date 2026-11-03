@@ -1,0 +1,29 @@
+{
+  "port": 9294,
+  "publicOrigin": "https://dotcord.example.com/",
+  "sourceAddress": "192.0.2.10",
+  "botUserId": "222222222222222222",
+  "applicationId": "888888888888888888",
+  "ownerUserId": "111111111111111111",
+  "ownerChannelId": "333333333333333333",
+  "stateDirectory": "/var/lib/dotcord/live-v2",
+  "botTokenFile": "/approved/external-credentials/discord-bot-token",
+  "encryptionKeyFile": "/approved/external-credentials/live-state-key",
+  "oauth": {
+    "installationId": "replace-with-stable-installation-id",
+    "stateDirectory": "/var/lib/dotcord/auth-v1",
+    "encryptionKeyFile": "/approved/external-credentials/auth-state-key",
+    "signingKeyFile": "/approved/external-credentials/issuer-signing-jwks",
+    "cookieKeyFile": "/approved/external-credentials/session-cookie-key",
+    "clientId": "dotcord-chatgpt-owner-v1",
+    "redirectUris": ["https://chatgpt.com/connector_platform_oauth_redirect"],
+    "discordClientId": "999999999999999999",
+    "discordClientSecretFile": "/approved/external-credentials/discord-login-client-secret"
+  },
+  "bindings": [{
+    "id": "owner", "senderId": "111111111111111111", "principal": "owner-consumer",
+    "audience": "owner-dm", "authorizedUntil": "2030-01-01T00:00:00Z", "grantVersion": 1,
+    "callbackApprovalFile": "/approved/external-credentials/owner-callback-approval",
+    "scopes": ["discord:status", "discord:context:read", "discord:attachments:read", "discord:reply", "discord:events:subscribe"]
+  }]
+}

@@ -7,6 +7,8 @@ import { DiscordEventsBridge } from "./bridge.js";
 import { DiscordGateway, gatewayUrl } from "./gateway.js";
 import { createNetwork, equal } from "./networking.js";
 import { EncryptedStore, isWithin, readPrivateFile } from "./storage.js";
+import { createOAuth, type AuthTransport, type OAuthRuntime } from "./oauth.js";
+import type { BridgeRecords } from "./storage.js";
 
 export type Network = ReturnType<typeof createNetwork>;
 export type Runtime = Awaited<ReturnType<typeof createRuntime>>;
@@ -32,11 +34,12 @@ export async function verifyDiscordIdentity(network: Pick<Network,"discord">, co
   return {url:gatewayUrl(gateway.url),identifyLimit:Math.min(8,remaining as number)};
 }
 /** Adapters are injectable only in-process; HTTP callers cannot replace providers or claim principals. */
-export async function createRuntime(config: Config, createAdapter = createNetwork, log: (code: string) => void = () => {}) {
+export async function createRuntime(config: Config, createAdapter = createNetwork, log: (code: string) => void = () => {}, options: { authTransport?:AuthTransport } = {}) {
   const bridges = new Map<string, DiscordEventsBridge>();
   let store: EncryptedStore | undefined, network: Network | undefined, gateway: DiscordGateway | undefined;
+  let oauth:OAuthRuntime|undefined;
   let timer: ReturnType<typeof setInterval> | undefined, maintenance: Promise<void> | undefined, stopped = false;
-  const fingerprints = () => config.bindings.map(binding => bearerDigest(binding.bearerFile));
+  const fingerprints = () => config.bindings.map(binding => bearerDigest(binding.bearerFile!));
   const access = (bindingId: string) => {
     if (stopped || !config.enabled) return false;
     const binding = config.bindings.find(item => item.id === bindingId);
@@ -44,6 +47,7 @@ export async function createRuntime(config: Config, createAdapter = createNetwor
     try { const hashes = fingerprints(); return new Set(hashes).size === hashes.length; } catch { return false; }
   };
   const authenticate = (header: string | undefined) => {
+    if (config.authEnabled) return oauth?.authenticate(header);
     if (!header?.startsWith("Bearer ") || header.length > 4103) return undefined;
     const digest = createHash("sha256").update(header.slice(7)).digest("hex");
     let hashes: string[];
@@ -56,39 +60,42 @@ export async function createRuntime(config: Config, createAdapter = createNetwor
     for (const bridge of bridges.values()) bridge.stop();
     await network?.close();
     await Promise.all([...bridges.values()].map(bridge => bridge.drain()));
-    await maintenance; store?.prune(); store?.close();
+    await maintenance; store?.prune(); store?.close();await oauth?.stop();
   };
   try {
+    if (config.authEnabled) oauth=await createOAuth(config,log,options.authTransport);
     if (config.enabled) {
       const packageDirectory = resolve(dirname(fileURLToPath(import.meta.url)),"..");
-      for (const path of [config.botTokenFile!,config.encryptionKeyFile!,...config.bindings.map(item => item.bearerFile)]) {
+      for (const path of [config.botTokenFile!,config.encryptionKeyFile!,...config.bindings.flatMap(item => item.bearerFile?[item.bearerFile]:[])]) {
         if (isWithin(path,packageDirectory) || isWithin(path,config.stateDirectory!)) throw new Error("credentials_must_remain_external");
       }
-      const hashes = fingerprints();
+      const hashes = oauth ? [] : fingerprints();
       if (new Set(hashes).size !== hashes.length) throw new Error("sender_bearers_must_be_separate");
       const token = secretText(config.botTokenFile!);
       if (!/^[A-Za-z0-9._-]{20,4096}$/.test(token)) throw new Error("invalid_bot_token_reference");
       const encoded = secretText(config.encryptionKeyFile!), key = Buffer.from(encoded,"base64");
       if (key.length !== 32 || key.toString("base64") !== encoded) throw new Error("invalid_storage_key_reference");
       if ([token,encoded].some(value => hashes.includes(createHash("sha256").update(value).digest("hex")))) throw new Error("credential_roles_must_be_separate");
-      const scope = JSON.stringify([config.applicationId,config.botUserId,config.ownerUserId,config.ownerChannelId,
-        config.bindings.map(({id,senderId,principal,callbackUrl}) => ({id,senderId,principal,callbackUrl}))]);
+      if (oauth && key.equals(Buffer.from(readPrivateFile(config.oauth!.encryptionKeyFile).toString("utf8").trim(),"base64"))) throw new Error("credential_roles_must_be_separate");
+      const scope = oauth ? JSON.stringify(["live-v2",config.oauth!.installationId,config.applicationId,config.botUserId,config.ownerUserId,config.ownerChannelId])
+        : JSON.stringify([config.applicationId,config.botUserId,config.ownerUserId,config.ownerChannelId,config.bindings.map(({id,senderId,principal,callbackUrl}) => ({id,senderId,principal,callbackUrl}))]);
       store = new EncryptedStore(config.stateDirectory!,key,scope);
       store.prune();
       network = createAdapter(token,callbackHosts,config.sourceAddress!);
       const verified = await verifyDiscordIdentity(network,config);
       for (const binding of config.bindings) {
         const bridgeConfig: BridgeConfig = {enabled:true,botUserId:config.botUserId!,ownerUserId:config.ownerUserId!,senderUserId:binding.senderId,
-          ownerChannelId:config.ownerChannelId!,audience:binding.audience,callbackHosts,callbackUrl:binding.callbackUrl};
+          ownerChannelId:config.ownerChannelId!,audience:binding.audience,callbackHosts,callbackUrl:binding.callbackUrl??""};
         bridges.set(binding.id,new DiscordEventsBridge(bridgeConfig,store.records(binding.id),network.post,network.send,
-          async principal => principal === binding.principal && access(binding.id),log,Date.now,network.typing,network.readAttachment));
+          async (principal,authority) => principal === binding.principal && (oauth ? oauth.authorize(principal,authority) : access(binding.id)),log,Date.now,network.typing,network.readAttachment,
+          oauth?.store.records(binding.id),()=>config.enabled));
       }
       const adapter = network;
       gateway = new DiscordGateway(token,config.botUserId!,verified.url,async input => {
         if (!input || typeof input !== "object" || !("author" in input)) return;
         const sender = (input.author as {id?:unknown})?.id;
         const binding = config.bindings.find(item => item.senderId === sender);
-        if (binding && access(binding.id)) await bridges.get(binding.id)!.receive(input);
+        if (binding && (oauth ? await oauth.authorize(binding.principal) : access(binding.id))) await bridges.get(binding.id)!.receive(input);
       },log,{...verified,applicationId:config.applicationId!,directed:config.bindings.some(binding => binding.audience === "directed"),
         guildMessageContent:config.guildMessageContent,factory:url => adapter.socket(url)});
       let pumping = false;
@@ -102,6 +109,14 @@ export async function createRuntime(config: Config, createAdapter = createNetwor
       },2000).unref();
       gateway.start();
     }
+    if(oauth && !config.enabled) {
+      const unavailable:BridgeRecords={get:async()=>{throw new Error("intake_disabled");},put:async()=>{throw new Error("intake_disabled");},list:async()=>[],delete:async()=>{throw new Error("intake_disabled");}};
+      for(const binding of config.bindings) {
+        const bridgeConfig:BridgeConfig={enabled:true,botUserId:config.botUserId!,ownerUserId:config.ownerUserId!,senderUserId:binding.senderId,ownerChannelId:config.ownerChannelId!,audience:binding.audience,callbackHosts,callbackUrl:binding.callbackUrl??""};
+        bridges.set(binding.id,new DiscordEventsBridge(bridgeConfig,unavailable,oauth.network.post,async()=>{throw new Error("intake_disabled");},
+          async(principal,authority)=>principal===binding.principal && oauth!.authorize(principal,authority),log,Date.now,undefined,undefined,oauth.store.records(binding.id),()=>false));
+      }
+    }
   } catch (error) { await stop(); throw error; }
-  return {config,bridges,authenticate,stop,status:() => ({enabled:config.enabled,ready:!config.enabled || Boolean(gateway?.ready && [...bridges.values()].every(bridge => bridge.status().healthy && !bridge.status().stopped))})};
+  return {config,bridges,authenticate,oauth,stop,status:() => ({enabled:config.enabled,...(config.authEnabled?{authenticationEnabled:true}:{}),ready:!config.enabled || Boolean(gateway?.ready && [...bridges.values()].every(bridge => bridge.status().healthy && !bridge.status().stopped))})};
 }

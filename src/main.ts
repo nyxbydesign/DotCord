@@ -6,7 +6,7 @@ import { startHttpServer } from "./http.js";
 
 export async function start(env = process.env) {
   const input: unknown = env.DOTCORD_CONFIG ? JSON.parse(await readFile(env.DOTCORD_CONFIG,"utf8")) : {};
-  const config = parseConfig(input,env.DOTCORD_NETWORK_ENABLED === "1");
+  const config = parseConfig(input,env.DOTCORD_NETWORK_ENABLED === "1",env.DOTCORD_AUTH_ENABLED === "1");
   const runtime = await createRuntime(config,undefined,code => { if (/^[a-z_]+$/.test(code)) console.info(code); });
   try {
     const http = await startHttpServer(runtime);
