@@ -30,7 +30,7 @@ export function requiredScopes(method:string,name?:string):OAuthScope[] {
 function textSecret(path:string) {const b=readPrivateFile(path);try{return b.toString("utf8").trim();}finally{b.fill(0);}}
 function keySecret(path:string) {const s=textSecret(path),b=Buffer.from(s,"base64");if(b.length!==32 || b.toString("base64")!==s)throw new Error("invalid_oauth_key");return b;}
 function html(value:string) {return value.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]!));}
-function answer(res:ServerResponse,status:number,body:string,type="text/html") {res.writeHead(status,{"content-type":type+"; charset=utf-8","cache-control":"no-store","x-content-type-options":"nosniff","referrer-policy":"no-referrer","content-security-policy":"default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"});res.end(body);}
+function answer(res:ServerResponse,status:number,body:string,type="text/html",referrerPolicy:"no-referrer"|"same-origin"="no-referrer") {res.writeHead(status,{"content-type":type+"; charset=utf-8","cache-control":"no-store","x-content-type-options":"nosniff","referrer-policy":referrerPolicy,"content-security-policy":"default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"});res.end(body);}
 async function form(req:IncomingMessage) {
   if(req.headers["content-type"]?.split(";",1)[0]!=="application/x-www-form-urlencoded" || req.headers["content-encoding"])throw new OAuthError(400,"invalid_request");
   let length=0;const chunks:Buffer[]=[];
@@ -170,7 +170,8 @@ export async function createOAuth(config:Config,log:(code:string)=>void=()=>{},i
         if(req.method==="GET" && d.prompt.name==="consent") {
           const b=bindingFor(d.session?.accountId);if(!b)throw new OAuthError(403,"identity_denied");
           const csrf=randomBytes(32).toString("base64url");store.set("consent",d.uid,{csrf,subject:d.session.accountId},Date.now()+300000);setCookie(res,"__Host-dotcord-consent",csrf);
-          answer(res,200,`<!doctype html><title>Authorize DotCord</title><h1>Authorize DotCord</h1><p>Allow this connection to receive and reply to your owner Discord DM for at most 24 hours, ending no later than ${html(b.authorizedUntil)}.</p><p>Permissions: ${html(b.scopes.join(", "))}</p><form method="post"><input type="hidden" name="csrf" value="${csrf}"><button name="action" value="approve">Authorize</button><button name="action" value="deny">Cancel</button></form>`);return true;
+          // Preserve the browser's same-origin form Origin without sharing this interaction URL across origins.
+          answer(res,200,`<!doctype html><title>Authorize DotCord</title><h1>Authorize DotCord</h1><p>Allow this connection to receive and reply to your owner Discord DM for at most 24 hours, ending no later than ${html(b.authorizedUntil)}.</p><p>Permissions: ${html(b.scopes.join(", "))}</p><form method="post"><input type="hidden" name="csrf" value="${csrf}"><button name="action" value="approve">Authorize</button><button name="action" value="deny">Cancel</button></form>`,"text/html","same-origin");return true;
         }
         if(req.method==="POST" && d.prompt.name==="consent") {
           if(req.headers.origin!==origin)throw new OAuthError(403,"origin_denied");
