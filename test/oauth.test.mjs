@@ -51,16 +51,25 @@ async function harness(t) {
     });r.on("error",reject);r.end(body);});
   };
   const walk=async(response)=>{for(let i=0;i<10&&[302,303].includes(response.status);i++){const next=new URL(response.headers.location,ORIGIN);if(next.origin!==ORIGIN)return {...response,destination:next};response=await req(next.href);}return response;};
-  const login=async()=>{
+  const login=async({checkConsentOrigins=false}={})=>{
     const verifier="synthetic_pkce_verifier_012345678901234567890123456789",challenge=(await import("node:crypto")).createHash("sha256").update(verifier).digest("base64url");
     const params=new URLSearchParams({client_id:input.oauth.clientId,response_type:"code",redirect_uri:REDIRECT,scope:"openid offline_access "+oauthScopes.join(" "),resource:RESOURCE,state:"synthetic-openai-state",code_challenge:challenge,code_challenge_method:"S256",prompt:"consent"});
     let r=await walk(await req("/oauth/authorize?"+params));assert.equal(r.destination?.origin,"https://discord.com",r.text);
     assert.equal(r.destination.searchParams.get("scope"),"identify");assert.equal(r.destination.searchParams.get("code_challenge_method"),"S256");
     const ret=new URL(ISSUER+"/login/discord/callback");ret.searchParams.set("state",r.destination.searchParams.get("state"));ret.searchParams.set("code","synthetic-discord-code");ret.searchParams.set("iss","https://discord.com");
-    r=await walk(await req(ret.href));assert.equal(r.status,200,r.text);assert.match(r.text,/Authorize DotCord/);
+    const returned=await req(ret.href);assert.equal(returned.headers["referrer-policy"],"no-referrer");
+    r=await walk(returned);assert.equal(r.status,200,r.text);assert.match(r.text,/Authorize DotCord/);assert.equal(r.headers["referrer-policy"],"same-origin");
     const csrf=/name="csrf" value="([^"]+)"/.exec(r.text)?.[1];assert.ok(csrf,r.text);
     const consentPath=r.url;
-    r=await walk(await req(consentPath,"POST",new URLSearchParams({csrf,action:"approve"}).toString(),{"content-type":"application/x-www-form-urlencoded",origin:ORIGIN}));
+    const consentBody=new URLSearchParams({csrf,action:"approve"}).toString();
+    if(checkConsentOrigins) {
+      const uid=new URL(consentPath).pathname.split("/").pop();
+      for(const origin of ["null","https://chatgpt.com"]) {
+        const denied=await req(consentPath,"POST",consentBody,{"content-type":"application/x-www-form-urlencoded",origin});
+        assert.equal(denied.status,403,denied.text);assert.equal(runtime.oauth.store.get("consent",uid).value.consumed,undefined,"rejected origin cannot consume consent");assert.equal(runtime.oauth.grantFor("owner"),undefined);
+      }
+    }
+    r=await walk(await req(consentPath,"POST",consentBody,{"content-type":"application/x-www-form-urlencoded",origin:ORIGIN}));
     assert.equal(r.destination?.origin,"https://chatgpt.com",r.text);assert.equal(r.destination.searchParams.get("iss"),ISSUER);assert.equal(r.destination.searchParams.get("state"),"synthetic-openai-state");
     const code=r.destination.searchParams.get("code");assert.ok(code);
     const exchange=async(overrides={})=>req("/oauth/token","POST",new URLSearchParams({client_id:input.oauth.clientId,grant_type:"authorization_code",redirect_uri:REDIRECT,resource:RESOURCE,code,code_verifier:verifier,...overrides}).toString(),{"content-type":"application/x-www-form-urlencoded"});
@@ -75,7 +84,7 @@ test("actual maintained issuer completes PKCE login and finite refresh; auth-onl
   const metadata=f.json(await f.req("/.well-known/oauth-protected-resource/mcp"));assert.equal(metadata.resource,RESOURCE);assert.deepEqual(metadata.authorization_servers,[ISSUER]);
   const discovery=f.json(await f.req("/oauth/.well-known/openid-configuration"));assert.equal(discovery.issuer,ISSUER);assert.deepEqual(discovery.code_challenge_methods_supported,["S256"]);assert.equal(discovery.authorization_response_iss_parameter_supported,true);assert.equal(discovery.registration_endpoint,undefined);
   assert.equal((await f.req("/mcp","POST","{}",{"content-type":"application/json"})).status,401);
-  const login=await f.login(),issued=await login.exchange();assert.equal(issued.status,200,issued.text);const token=f.json(issued);assert.ok(token.access_token);assert.ok(token.refresh_token);assert.ok(token.expires_in<=300);
+  const login=await f.login({checkConsentOrigins:true}),issued=await login.exchange();assert.equal(issued.status,200,issued.text);const token=f.json(issued);assert.ok(token.access_token);assert.ok(token.refresh_token);assert.ok(token.expires_in<=300);
   const claims=decodeJwt(token.access_token);assert.equal(claims.aud,RESOURCE);assert.equal(claims.client_id,f.input.oauth.clientId);assert.ok(claims.grant_id);assert.equal(claims.grant_version,1);
   assert.equal((await f.rpc(token.access_token,"tools/call",{name:"discord_connection_status",arguments:{}})).status,200);
   const key=await importJWK(JWK,"ES256");
