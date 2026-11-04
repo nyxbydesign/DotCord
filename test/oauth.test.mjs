@@ -59,6 +59,7 @@ async function harness(t) {
     const ret=new URL(ISSUER+"/login/discord/callback");ret.searchParams.set("state",r.destination.searchParams.get("state"));ret.searchParams.set("code","synthetic-discord-code");ret.searchParams.set("iss","https://discord.com");
     const returned=await req(ret.href);assert.equal(returned.headers["referrer-policy"],"no-referrer");
     r=await walk(returned);assert.equal(r.status,200,r.text);assert.match(r.text,/Authorize DotCord/);assert.equal(r.headers["referrer-policy"],"same-origin");
+    assert.equal(r.headers["content-security-policy"],`default-src 'none'; form-action 'self' ${REDIRECT}; frame-ancestors 'none'; base-uri 'none'`);
     const csrf=/name="csrf" value="([^"]+)"/.exec(r.text)?.[1];assert.ok(csrf,r.text);
     const consentPath=r.url;
     const consentBody=new URLSearchParams({csrf,action:"approve"}).toString();
@@ -81,6 +82,7 @@ async function harness(t) {
 
 test("actual maintained issuer completes PKCE login and finite refresh; auth-only, token checks and callback isolation survive restart",async t=>{
   const f=await harness(t);
+  const invalidCallback=await f.req("/oauth/login/discord/callback");assert.equal(invalidCallback.status,400);assert.equal(invalidCallback.headers["content-security-policy"],"default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");assert.equal(invalidCallback.headers["referrer-policy"],"no-referrer");
   const metadata=f.json(await f.req("/.well-known/oauth-protected-resource/mcp"));assert.equal(metadata.resource,RESOURCE);assert.deepEqual(metadata.authorization_servers,[ISSUER]);
   const discovery=f.json(await f.req("/oauth/.well-known/openid-configuration"));assert.equal(discovery.issuer,ISSUER);assert.deepEqual(discovery.code_challenge_methods_supported,["S256"]);assert.equal(discovery.authorization_response_iss_parameter_supported,true);assert.equal(discovery.registration_endpoint,undefined);
   assert.equal((await f.req("/mcp","POST","{}",{"content-type":"application/json"})).status,401);
