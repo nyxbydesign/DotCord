@@ -7,7 +7,7 @@ export type Versioned<T> = { value: T; etag: string };
 export type BridgeRecordSummary = { key: string; expires?: number; queued?: boolean; next?: number };
 export type BridgeRecords = {
   get<T>(type: string, key: string): Promise<Versioned<T> | undefined>;
-  put<T>(type: string, key: string, value: T, etag: string | null, expires?: number): Promise<Versioned<T>>;
+  put<T>(type: string, key: string, value: T, etag: string | null, expires?: number | null): Promise<Versioned<T>>;
   list(type: string, limit: number): Promise<BridgeRecordSummary[]>;
   delete(type: string, key: string): Promise<void>;
 };
@@ -74,7 +74,7 @@ export class EncryptedStore {
       get: async <T>(type: string, key: string) => {
         const row = query(type,key); return row ? { value: this.open<T>(scope,type,key,row.body), etag: row.etag } : undefined;
       },
-      put: async <T>(type: string, key: string, value: T, etag: string | null, expires?: number) => {
+      put: async <T>(type: string, key: string, value: T, etag: string | null, expires?: number | null) => {
         if (Buffer.byteLength(JSON.stringify(value)) > 262144) throw new Error("record_too_large");
         const next = randomUUID(), bytes = this.seal(scope,type,key,value);
         const result = etag === null

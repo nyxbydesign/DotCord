@@ -9,10 +9,12 @@ import { callbackHosts, oauthScopes, type Config, type SenderBinding, type OAuth
 import { callbackUrl, createNetwork, equal } from "./networking.js";
 import { isWithin, readPrivateFile } from "./storage.js";
 import type { Network } from "./runtime.js";
+import { deadlineActive, deadlineFrom, deadlineIso, earlierDeadline } from "./deadline.js";
 
 const DAY=86400000;
-export type Authorization = { id:string; version:number; bindingId:string; subject:string; clientId:string; scopes:OAuthScope[]; started:number; until:number; revoked:boolean; providerGrantId?:string };
-export type Authenticated = SenderBinding & { authority:string; grantId:string; grantVersion:number; authorizedUntil:string };
+const REFRESH_LEASE=7*DAY;
+export type Authorization = { id:string; version:number; bindingId:string; subject:string; clientId:string; scopes:OAuthScope[]; started:number; until:number|null; revoked:boolean; providerGrantId?:string };
+export type Authenticated = SenderBinding & { authority:string; grantId:string; grantVersion:number; authorizedUntil:string|null };
 export type AuthTransport=Pick<Network,"request"|"post"|"close">;
 export class OAuthError extends Error {constructor(readonly status:number,readonly code:string,readonly scope?:string){super(code);}}
 export const issuerFor=(config:Config)=>new URL("oauth",config.publicOrigin!).href;
@@ -60,27 +62,44 @@ export async function createOAuth(config:Config,log:(code:string)=>void=()=>{},i
   const subjectFor=(b:SenderBinding)=>authHash(JSON.stringify([issuer,b.senderId]));
   const bindingFor=(subject:string)=>config.bindings.find(b=>subjectFor(b)===subject);
   const grantFor=(bindingId:string)=>store.get("authorization",bindingId,true)?.value as Authorization|undefined;
-  const active=(g:Authorization|undefined)=>!stopped && Boolean(g && !g.revoked && g.until>Date.now() && config.bindings.some(b=>b.id===g.bindingId && b.grantVersion===g.version && Date.parse(b.authorizedUntil)>=g.until));
-  const byProvider=(providerId:string)=>{const link=store.get("provider-link",providerId,true);return link?grantFor(String(link.value.bindingId)):undefined;};
-  const revoke=(bindingId:string)=>{const g=grantFor(bindingId);if(g&&!g.revoked){store.set("authorization",bindingId,{...g,revoked:true},Number.MAX_SAFE_INTEGER);store.audit("grant_revoked",g.id);}};
+  const active=(g:Authorization|undefined)=>!stopped && Boolean(g && !g.revoked && deadlineActive(g.until) && config.bindings.some(b=>b.id===g.bindingId && b.grantVersion===g.version
+    && (b.authorizedUntil===null || g.until!==null && Date.parse(b.authorizedUntil)>=g.until) && g.scopes.every(scope=>b.scopes.includes(scope))));
+  const byProvider=(providerId:string)=>{
+    const link=store.get("provider-link",providerId,true);if(!link)return undefined;const g=grantFor(String(link.value.bindingId));
+    // Legacy finite links are valid only for the exact provider grant still recorded on their authorization.
+    if(!g || g.providerGrantId!==providerId || link.value.authorizationId!==undefined&&(link.value.authorizationId!==g.id||link.value.version!==g.version))return undefined;
+    return g;
+  };
+  const revoke=(bindingId:string)=>{const g=grantFor(bindingId);if(g&&!g.revoked){store.set("authorization",bindingId,{...g,revoked:true},null);store.audit("grant_revoked",g.id);}};
   const revokeProvider=(providerId:string)=>{const g=byProvider(providerId);if(g)revoke(g.bindingId);store.revokeProviderGrant(providerId);};
   const assertGrant=(providerId:string,subject?:string)=>{const g=byProvider(providerId);if(!active(g) || subject && g!.subject!==subject)throw new errors.InvalidGrant("authorization is not active");return g!;};
   const ensureGrant=(binding:SenderBinding):Authorization=>store.atomic(()=>{
     const old=grantFor(binding.id);
     if(old?.version===binding.grantVersion){if(!active(old))throw new errors.AccessDenied("authorization expired or revoked");return old;}
     if(old && binding.grantVersion<=old.version)throw new errors.AccessDenied("authorization generation denied");
-    const now=Date.now(),until=Math.min(now+DAY,Date.parse(binding.authorizedUntil));if(until<=now)throw new errors.AccessDenied("authorization expired");
+    const now=Date.now(),until=binding.authorizedUntil===null?null:Math.min(now+DAY,Date.parse(binding.authorizedUntil));if(!deadlineActive(until,now))throw new errors.AccessDenied("authorization expired");
+    // A replaced generation cannot be used again. Retire only its provider credentials/link, never callback or reply state.
+    if(old?.providerGrantId){store.revokeProviderGrant(old.providerGrantId);store.delete("provider-link",old.providerGrantId);}
     const g:Authorization={id:randomBytes(24).toString("base64url"),version:binding.grantVersion,bindingId:binding.id,subject:subjectFor(binding),clientId:options.clientId,scopes:[...binding.scopes],started:now,until,revoked:false};
-    store.set("authorization",binding.id,g,Number.MAX_SAFE_INTEGER);store.audit("grant_consented",g.id);return g;
+    store.set("authorization",binding.id,g,null);store.audit("grant_consented",g.id);return g;
   });
+  const creatingGrants=new Map<string,Authorization>();
   class Adapter {
     constructor(private readonly model:string) {}
     async upsert(id:string,payload:Record<string,unknown>,expiresIn:number) {
+      if(this.model==="Grant") {
+        const g=byProvider(id)??creatingGrants.get(id);
+        if(!active(g)||payload.accountId!==g!.subject||payload.clientId!==g!.clientId)throw new errors.InvalidGrant("authorization is not active");
+        // oidc-provider TTL callbacks require finite positive seconds. Its persistent opaque Grant accepts an absent exp.
+        // Continuous authority therefore keeps only the current Grant durable; credentials retain bounded lifetimes.
+        if(g!.until===null){const {exp,...durable}=payload;store.set(this.model,id,durable,null);return;}
+        store.set(this.model,id,payload,earlierDeadline(Date.now()+expiresIn*1000,g!.until));return;
+      }
       if(payload.grantId && this.model!=="Grant")assertGrant(String(payload.grantId),typeof payload.accountId==="string"?payload.accountId:undefined);
-      const cutoff=payload.grantId?byProvider(String(payload.grantId))?.until:undefined;
-      store.set(this.model,id,payload,Math.min(Date.now()+expiresIn*1000,cutoff??Infinity));
+      const cutoff=payload.grantId?byProvider(String(payload.grantId))?.until??null:null;
+      store.set(this.model,id,payload,earlierDeadline(Date.now()+expiresIn*1000,cutoff));
     }
-    async find(id:string) {const row=store.get(this.model,id);if(!row)return undefined;if(row.value.grantId)assertGrant(String(row.value.grantId));return row.value;}
+    async find(id:string) {const row=store.get(this.model,id);if(!row)return undefined;if(this.model==="Grant"&&!active(byProvider(id)))return undefined;if(row.value.grantId)assertGrant(String(row.value.grantId),typeof row.value.accountId==="string"?row.value.accountId:undefined);return row.value;}
     async findByUid(uid:string) {return store.find(this.model,"uid_ref",uid);}
     async findByUserCode(code:string) {return store.find(this.model,"user_ref",code);}
     async destroy(id:string) {if(this.model==="Grant")revokeProvider(id);else store.delete(this.model,id);}
@@ -89,7 +108,8 @@ export async function createOAuth(config:Config,log:(code:string)=>void=()=>{},i
   }
   const tokenTTL=(_ctx:unknown,token:{grantId?:string;accountId?:string})=>{
     const g=token.grantId?byProvider(token.grantId):token.accountId?grantFor(bindingFor(token.accountId)?.id??""):undefined;
-    return Math.max(0,Math.min(300,Math.floor(((g?.until??Date.now())-Date.now())/1000)));
+    if(!active(g))throw new errors.InvalidGrant("authorization is not active");
+    return g!.until===null?300:Math.max(1,Math.min(300,Math.floor((g!.until-Date.now())/1000)));
   };
   let provider:any;
   try {
@@ -106,16 +126,18 @@ export async function createOAuth(config:Config,log:(code:string)=>void=()=>{},i
       routes:{authorization:"/authorize",token:"/token",jwks:"/jwks",revocation:"/revoke",userinfo:"/userinfo"},
       interactions:{url:(_ctx:unknown,interaction:{uid:string})=>`${issuer}/interaction/${interaction.uid}`},
       findAccount:async(_ctx:unknown,id:string)=>bindingFor(id)?{accountId:id,claims:async()=>({sub:id})}:undefined,
-      loadExistingGrant:async(ctx:any)=>{const id=ctx.oidc.result?.consent?.grantId??ctx.oidc.session.grantIdFor(options.clientId);if(!id)return undefined;assertGrant(id,ctx.oidc.session.accountId);return provider.Grant.find(id);},
+      loadExistingGrant:async(ctx:any)=>{const submitted=ctx.oidc.result?.consent?.grantId,id=submitted??ctx.oidc.session.grantIdFor(options.clientId);if(!id)return undefined;
+        // An expired/replaced session grant cannot authorize, but must not prevent a fresh explicit consent prompt.
+        if(!submitted&&!active(byProvider(id)))return undefined;assertGrant(id,ctx.oidc.session.accountId);return provider.Grant.find(id);},
       ttl:{AuthorizationCode:60,Interaction:300,Session:900,IdToken:300,AccessToken:tokenTTL,
-        Grant:(_ctx:unknown,grant:any)=>Math.max(1,Math.floor(((grantFor(bindingFor(grant.accountId)?.id??"")?.until??Date.now())-Date.now())/1000)),
-        RefreshToken:(_ctx:unknown,token:any)=>Math.max(0,Math.floor((assertGrant(token.grantId).until-Date.now())/1000))},
+        Grant:(_ctx:unknown,grant:any)=>{const g=grantFor(bindingFor(grant.accountId)?.id??"");return g?.until===null?REFRESH_LEASE/1000:Math.max(1,Math.floor(((g?.until??Date.now())-Date.now())/1000));},
+        RefreshToken:(_ctx:unknown,token:any)=>{const g=assertGrant(token.grantId);return g.until===null?REFRESH_LEASE/1000:Math.max(1,Math.min(REFRESH_LEASE/1000,Math.floor((g.until-Date.now())/1000)));}},
       formats:{customizers:{jwt:async(ctx:any,token:any,jwt:any)=>{
         const g=assertGrant(token.grantId,token.accountId),r=ctx?.oidc?.params?.resource;
         if(r!==resource && !(Array.isArray(r)&&r.length===1&&r[0]===resource))throw new errors.InvalidTarget();
         if(token.clientId!==options.clientId)throw new errors.InvalidGrant();
         jwt.payload.grant_id=g.id;jwt.payload.grant_version=g.version;jwt.payload.nbf=jwt.payload.iat;
-        jwt.payload.exp=Math.min(jwt.payload.exp,Math.floor(g.until/1000));
+        if(g.until!==null)jwt.payload.exp=Math.min(jwt.payload.exp,Math.floor(g.until/1000));
       }}},
       renderError:async(ctx:any)=>{log("oauth_request_denied");ctx.type="html";ctx.body="<!doctype html><title>Authorization failed</title><p>Authorization failed. Return to the connection and try again.</p>";}
     });
@@ -173,7 +195,8 @@ export async function createOAuth(config:Config,log:(code:string)=>void=()=>{},i
           const csrf=randomBytes(32).toString("base64url");store.set("consent",d.uid,{csrf,subject:d.session.accountId},Date.now()+300000);setCookie(res,"__Host-dotcord-consent",csrf);
           // Preserve the browser's same-origin form Origin without sharing this interaction URL across origins.
           // CSP ignores source paths after redirects; issuer registration remains the exact redirect boundary.
-          answer(res,200,`<!doctype html><title>Authorize DotCord</title><h1>Authorize DotCord</h1><p>Allow this connection to receive and reply to your owner Discord DM for at most 24 hours, ending no later than ${html(b.authorizedUntil)}.</p><p>Permissions: ${html(b.scopes.join(", "))}</p><form method="post"><input type="hidden" name="csrf" value="${csrf}"><button name="action" value="approve">Authorize</button><button name="action" value="deny">Cancel</button></form>`,"text/html","same-origin",redirect);return true;
+          const duration=b.authorizedUntil===null?"until you revoke this connection":`for at most 24 hours, ending no later than ${html(b.authorizedUntil)}`;
+          answer(res,200,`<!doctype html><title>Authorize DotCord</title><h1>Authorize DotCord</h1><p>Allow this connection to receive and reply to your owner Discord DM ${duration}.</p><p>Permissions: ${html(b.scopes.join(", "))}</p><form method="post"><input type="hidden" name="csrf" value="${csrf}"><button name="action" value="approve">Authorize</button><button name="action" value="deny">Cancel</button></form>`,"text/html","same-origin",redirect);return true;
         }
         if(req.method==="POST" && d.prompt.name==="consent") {
           if(req.headers.origin!==origin)throw new OAuthError(403,"origin_denied");
@@ -185,7 +208,10 @@ export async function createOAuth(config:Config,log:(code:string)=>void=()=>{},i
           if(!grant)grant=new provider.Grant({accountId:g.subject,clientId:options.clientId});
           // Advertised scopes also participate in the provider's OP consent policy; record the same approved set in both views.
           grant.addOIDCScope(["openid","offline_access",...g.scopes].join(" "));grant.addResourceScope(resource,g.scopes.join(" "));
-          const providerGrantId=await grant.save();store.atomic(()=>{store.set("authorization",b.id,{...g,providerGrantId},Number.MAX_SAFE_INTEGER);store.set("provider-link",providerGrantId,{bindingId:b.id},Number.MAX_SAFE_INTEGER);});
+          if(!grant.jti)grant.jti=grant.generateTokenId();creatingGrants.set(grant.jti,g);
+          let providerGrantId:string;try{providerGrantId=await grant.save();}finally{creatingGrants.delete(grant.jti);}
+          store.atomic(()=>{const current=grantFor(b.id);if(current?.id!==g.id||current.version!==g.version||!active(current))throw new errors.InvalidGrant("authorization changed");
+            store.set("authorization",b.id,{...g,providerGrantId},null);store.set("provider-link",providerGrantId,{bindingId:b.id,authorizationId:g.id,version:g.version},null);});
           await provider.interactionFinished(req,res,{consent:{grantId:providerGrantId}},{mergeWithLastSubmission:true});return true;
         }
         throw new OAuthError(400,"invalid_interaction");
@@ -200,7 +226,7 @@ export async function createOAuth(config:Config,log:(code:string)=>void=()=>{},i
         if(token.token_type?.toLowerCase()!=="bearer" || typeof token.access_token!=="string" || token.access_token.length>4096 || token.scope!=="identify")throw new OAuthError(400,"identity_exchange_failed");
         const identity=await network.request("https://discord.com/api/v10/users/@me","GET",undefined,{authorization:"Bearer "+token.access_token},16384);
         if(identity.status!==200)throw new OAuthError(400,"identity_exchange_failed");const user=JSON.parse(identity.bodyText),b=config.bindings.find(x=>x.senderId===user.id);
-        if(!b || user.bot===true || b.senderId!==config.ownerUserId || Date.parse(b.authorizedUntil)<=Date.now())throw new OAuthError(403,"identity_denied");
+        if(!b || user.bot===true || b.senderId!==config.ownerUserId || !deadlineActive(deadlineFrom(b.authorizedUntil)))throw new OAuthError(403,"identity_denied");
         const receipt=randomBytes(32).toString("base64url");store.set("login-finish",receipt,{uid:pending.value.uid,subject:subjectFor(b)},Date.now()+60000,null);setCookie(res,"__Host-dotcord-login-finish",receipt,60);
         res.writeHead(303,{location:issuer+"/interaction/"+String(pending.value.uid)+"/login","cache-control":"no-store","referrer-policy":"no-referrer"});res.end();return true;
       }
@@ -216,7 +242,7 @@ export async function createOAuth(config:Config,log:(code:string)=>void=()=>{},i
       const b=bindingFor(p.sub),g=b?grantFor(b.id):undefined;if(!b || !active(g) || g!.id!==p.grant_id || g!.version!==p.grant_version || g!.clientId!==p.client_id)return undefined;
       const scopeNames:ReadonlySet<string>=new Set(oauthScopes),isScope=(value:string):value is OAuthScope=>scopeNames.has(value);
       const scopes=p.scope.split(" ");if(!scopes.every(isScope))return undefined;if(scopes.some(s=>!g!.scopes.includes(s)))return undefined;
-      return {...b,scopes,authority:g!.id+":"+g!.version,grantId:g!.id,grantVersion:g!.version,authorizedUntil:new Date(g!.until).toISOString()};
+      return {...b,scopes,authority:g!.id+":"+g!.version,grantId:g!.id,grantVersion:g!.version,authorizedUntil:deadlineIso(g!.until)};
     }catch{return undefined;}
   };
   const authorize=async(principal:string,authority?:string)=>{try{const b=config.bindings.find(x=>x.principal===principal),g=b?grantFor(b.id):undefined;return active(g)&&(!authority || authority===g!.id+":"+g!.version);}catch{return false;}};
@@ -235,7 +261,7 @@ export async function createOAuth(config:Config,log:(code:string)=>void=()=>{},i
     if(!approved || approved!==url){store.set("callback-pending",b.id,{callbackUrl:url,grantId:g!.id,grantVersion:g!.version},g!.until);throw new OAuthError(403,"callback_approval_required");}
     const old=store.get("callback-enrollment",b.id,true);
     if(old && old.value.callbackUrl!==url)throw new OAuthError(403,"callback_migration_required");
-    store.set("callback-enrollment",b.id,{callbackUrl:url,grantId:g!.id,grantVersion:g!.version},Number.MAX_SAFE_INTEGER);return {url,authority:g!.id+":"+g!.version};
+    store.set("callback-enrollment",b.id,{callbackUrl:url,grantId:g!.id,grantVersion:g!.version},null);return {url,authority:g!.id+":"+g!.version};
   };
   const maintenance=setInterval(()=>{try{store.prune();}catch{stopped=true;log("auth_storage_failed");}},60000).unref();
   return {issuer,resource,provider,store,handle,authenticate,authorize,enroll,grantFor,revoke,network,

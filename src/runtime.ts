@@ -9,6 +9,7 @@ import { createNetwork, equal } from "./networking.js";
 import { EncryptedStore, isWithin, readPrivateFile } from "./storage.js";
 import { createOAuth, type AuthTransport, type OAuthRuntime } from "./oauth.js";
 import type { BridgeRecords } from "./storage.js";
+import { deadlineActive, deadlineFrom } from "./deadline.js";
 
 export type Network = ReturnType<typeof createNetwork>;
 export type Runtime = Awaited<ReturnType<typeof createRuntime>>;
@@ -43,7 +44,7 @@ export async function createRuntime(config: Config, createAdapter = createNetwor
   const access = (bindingId: string) => {
     if (stopped || !config.enabled) return false;
     const binding = config.bindings.find(item => item.id === bindingId);
-    if (!binding || Date.parse(binding.authorizedUntil) <= Date.now()) return false;
+    if (!binding || !deadlineActive(deadlineFrom(binding.authorizedUntil))) return false;
     try { const hashes = fingerprints(); return new Set(hashes).size === hashes.length; } catch { return false; }
   };
   const authenticate = (header: string | undefined) => {

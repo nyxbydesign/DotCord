@@ -51,7 +51,7 @@ export function eventDefinition(audience: "owner-dm" | "directed") {
   };
 }
 const requestSchema = z.object({
-  principal: z.string().min(1).max(4096), authorizedUntil: z.number().finite(), authority: z.string().max(200).optional(),
+  principal: z.string().min(1).max(4096), authorizedUntil: z.number().finite().nullable(), authority: z.string().max(200).optional(),
   headers: z.record(z.string(), z.string()),
   rpc: z.object({ jsonrpc: z.literal("2.0"), id: z.union([z.string().max(200), z.number().finite()]), method: z.string().max(100), params: z.record(z.string(), z.unknown()) })
 });

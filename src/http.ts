@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { bridgeProtocol } from "./protocol.js";
 import type { Runtime } from "./runtime.js";
 import { OAuthError, oauthChallenge, requiredScopes } from "./oauth.js";
+import { deadlineFrom } from "./deadline.js";
 const MAX_REQUEST = 65536;
 function send(response: ServerResponse, status: number, body: unknown) {
   response.writeHead(status,{"content-type":"application/json","cache-control":"no-store","x-content-type-options":"nosniff"});
@@ -47,7 +48,7 @@ export async function startHttpServer(runtime: Runtime, port = runtime.config.po
       // Never trust body-supplied principals, expiry, headers or OAuth claims.
       const headers: Record<string,string>={};
       for (const name of ["mcp-protocol-version","mcp-method","mcp-name"]) if (typeof request.headers[name] === "string") headers[name]=request.headers[name];
-      const result = await bridgeProtocol(bridge,{principal:binding.principal,authorizedUntil:Date.parse(binding.authorizedUntil),
+      const result = await bridgeProtocol(bridge,{principal:binding.principal,authorizedUntil:deadlineFrom(binding.authorizedUntil),
         ...("authority" in binding?{authority:binding.authority}:{}),headers,rpc});
       send(response,result.status,result.body);
     } catch { if (!response.headersSent) send(response,500,{error:"internal_error"}); else response.destroy(); }

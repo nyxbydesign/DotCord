@@ -22,7 +22,7 @@
   },
   "bindings": [{
     "id": "owner", "senderId": "111111111111111111", "principal": "owner-consumer",
-    "audience": "owner-dm", "authorizedUntil": "2030-01-01T00:00:00Z", "grantVersion": 1,
+    "audience": "owner-dm", "authorizedUntil": null, "grantVersion": 1,
     "callbackApprovalFile": "/approved/external-credentials/owner-callback-approval",
     "scopes": ["discord:status", "discord:context:read", "discord:attachments:read", "discord:reply", "discord:events:subscribe"]
   }]

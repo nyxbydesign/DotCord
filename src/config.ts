@@ -14,7 +14,7 @@ const externalFile = z.string().min(1).refine(isAbsolute, "credential reference 
 const binding = z.object({
   id: z.string().regex(/^[a-z0-9-]{1,48}$/), senderId: snowflake,
   principal: z.string().min(1).max(200), bearerFile: externalFile.optional(),
-  authorizedUntil: z.iso.datetime({ offset: true }), callbackUrl: z.url().optional(),
+  authorizedUntil: z.iso.datetime({ offset: true }).nullable(), callbackUrl: z.url().optional(),
   callbackApprovalFile: externalFile.optional(), grantVersion: z.number().int().positive().default(1),
   scopes: z.array(z.enum(oauthScopes)).min(1).max(5).default([...oauthScopes]),
   audience: z.enum(["owner-dm", "directed"]).default("owner-dm")
@@ -63,7 +63,7 @@ export function parseConfig(input: unknown, enabled = false, authEnabled = false
     }
     if (authEnabled ? item.bearerFile !== undefined : !item.bearerFile || !item.callbackUrl) throw new Error("authentication_binding_mismatch");
     if (item.audience === "owner-dm" && item.senderId !== config.ownerUserId) throw new Error("owner_binding_mismatch");
-    if (Date.parse(item.authorizedUntil) <= Date.now()) throw new Error("expired_consumer_authorization");
+    if (item.authorizedUntil===null ? !authEnabled || item.audience!=="owner-dm" : Date.parse(item.authorizedUntil) <= Date.now()) throw new Error("expired_or_unsupported_consumer_authorization");
   }
   if (config.oauth && authEnabled) {
     if (config.bindings.some(item => item.audience !== "owner-dm" || item.senderId !== config.ownerUserId)) throw new Error("oauth_pilot_owner_dm_only");

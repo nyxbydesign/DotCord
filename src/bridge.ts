@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { z } from "zod";
+import { deadlineActive, deadlineIso, earlierDeadline, type Deadline } from "./deadline.js";
 import { snowflake, type BridgeConfig } from "./config.js";
 import { callbackUrl, equal, signature, signingKey, type BridgeResponse, type CallbackPost, type ReplySend } from "./networking.js";
 import type { BridgeRecords } from "./storage.js";
@@ -35,7 +36,7 @@ type ConversationRecord = {
   turns: Array<{ message_id: string; role: "user" | "assistant"; text: string; timestamp: string; image_message?: true }>;
 };
 export type Subscription = {
-  id: string; principal: string; url: string; secret: string; expires: number; authorizedUntil: number;
+  id: string; principal: string; url: string; secret: string; expires: Deadline; authorizedUntil: Deadline;
   active: boolean; verifiedUntil: number; generation: string; authority?: string; oldSecret?: string; rotateUntil?: number;
   audience: BridgeConfig["audience"];
 };
@@ -75,7 +76,7 @@ export class DiscordEventsBridge {
     if (typing) this.typing = new DiscordTyping(typing, async () => {
       const sub = (await this.controls.get<Subscription>("subscription", "dot"))?.value;
       return this.config.enabled && this.healthy && !this.stopped && Boolean(sub?.active
-        && sub.audience === this.config.audience && sub.expires > this.now() && sub.authorizedUntil > this.now()
+        && sub.audience === this.config.audience && deadlineActive(sub.expires,this.now()) && deadlineActive(sub.authorizedUntil,this.now())
         && this.intakeAllowed() && await this.access(sub.principal, sub.authority));
     }, log, now);
   }
@@ -122,7 +123,7 @@ export class DiscordEventsBridge {
     this.tail = work.catch(() => undefined);
     return work;
   }
-  private async put<T>(type: string, key: string, value: T, etag: string | null, expires?: number) {
+  private async put<T>(type: string, key: string, value: T, etag: string | null, expires?: number | null) {
     try { return await (type === "subscription" ? this.controls : this.records).put(type, key, value, etag, expires); }
     catch { this.healthy = false; this.typing?.clear(); throw new BridgeError(-32603, "storage_uncertain_stop_and_reconcile"); }
   }
@@ -143,10 +144,10 @@ export class DiscordEventsBridge {
     if (sub.oldSecret && (sub.rotateUntil ?? 0) > this.now()) keys.push(sub.oldSecret);
     return { "webhook-id": id, "webhook-timestamp": timestamp, "webhook-signature": keys.map((key) => signature(key, id, timestamp, body)).join(" "), "X-MCP-Subscription-Id": sub.id };
   }
-  subscribe(principal: string, input: unknown, authorizedUntil: number, authority?: string) { return this.serial(async () => {
+  subscribe(principal: string, input: unknown, authorizedUntil: Deadline, authority?: string) { return this.serial(async () => {
     await this.authorize(principal, authority);
     const params = this.identity(input);
-    if (!params.delivery.secret || !Number.isFinite(authorizedUntil) || authorizedUntil <= this.now()) throw new BridgeError(-32602, "invalid_parameters");
+    if (!params.delivery.secret || !deadlineActive(authorizedUntil,this.now())) throw new BridgeError(-32602, "invalid_parameters");
     try { signingKey(params.delivery.secret); } catch { throw new BridgeError(-32602, "invalid_signing_secret"); }
     const id = "sub_" + hash(JSON.stringify([principal, params.delivery.url, EVENT_NAME, { audience: params.arguments.audience }]));
     const old = await this.controls.get<Subscription>("subscription", "dot");
@@ -156,9 +157,9 @@ export class DiscordEventsBridge {
     const previous = old?.value;
     const sub: Subscription = {
       id, principal, authority, audience: this.config.audience, url: params.delivery.url, secret: params.delivery.secret, authorizedUntil,
-      expires: Math.min(this.now() + Math.min(params.ttlMs ?? DAY, DAY), authorizedUntil), active: true,
+      expires: earlierDeadline(params.ttlMs===null?null:this.now()+Math.min(params.ttlMs??DAY,DAY),authorizedUntil), active: true,
       verifiedUntil: previous?.authority === authority ? previous?.verifiedUntil ?? 0 : 0,
-      generation: previous?.active && previous.expires > this.now() && previous.authority === authority ? previous.generation : randomBytes(16).toString("hex")
+      generation: previous?.active && deadlineActive(previous.expires,this.now()) && previous.authority === authority ? previous.generation : randomBytes(16).toString("hex")
     };
     if (previous && previous.secret !== sub.secret) { sub.oldSecret = previous.secret; sub.rotateUntil = this.now() + 300_000; }
     else if (previous?.oldSecret && (previous.rotateUntil ?? 0) > this.now()) { sub.oldSecret = previous.oldSecret; sub.rotateUntil = previous.rotateUntil; }
@@ -177,7 +178,7 @@ export class DiscordEventsBridge {
     await this.put("subscription", "dot", sub, old?.etag ?? null);
     if (previous?.generation !== sub.generation) this.typing?.clear();
     this.log("subscription_active");
-    return { id, refreshBefore: new Date(sub.expires).toISOString(), cursor: null, truncated: false };
+    return { id, refreshBefore: deadlineIso(sub.expires), cursor: null, truncated: false };
   }); }
   unsubscribe(principal: string, input: unknown) { return this.serial(async () => {
     await this.authorize(principal);
@@ -225,7 +226,7 @@ export class DiscordEventsBridge {
       const attachments = imageAttachments(m.attachments ?? []);
       if (occurred < Math.max(this.startedAt, this.now() - 60_000) || occurred > this.now() + 60_000 || (!m.content.trim() && !attachments.length)) return false;
       const sub = await this.controls.get<Subscription>("subscription", "dot");
-      if (!sub?.value.active || sub.value.audience !== this.config.audience || sub.value.expires <= this.now() || sub.value.authorizedUntil <= this.now()) return false;
+      if (!sub?.value.active || sub.value.audience !== this.config.audience || !deadlineActive(sub.value.expires,this.now()) || !deadlineActive(sub.value.authorizedUntil,this.now())) return false;
       await this.authorize(sub.value.principal, sub.value.authority);
       if (await this.records.get("message", m.id)) return false;
       const messages = await this.records.list("message", 1000);
@@ -272,7 +273,7 @@ export class DiscordEventsBridge {
         storedSub = await this.put("subscription", "dot", { ...sub, oldSecret: undefined, rotateUntil: undefined }, storedSub!.etag);
         sub = storedSub.value;
       }
-      if (sub.audience !== this.config.audience || sub.expires <= this.now() || sub.authorizedUntil <= this.now() || !await this.access(sub.principal, sub.authority)) {
+      if (sub.audience !== this.config.audience || !deadlineActive(sub.expires,this.now()) || !deadlineActive(sub.authorizedUntil,this.now()) || !await this.access(sub.principal, sub.authority)) {
         await this.put("subscription", "dot", { ...sub, active: false, secret: "", oldSecret: undefined }, storedSub!.etag);
         this.typing?.clear();
         this.log("subscription_expired_or_revoked"); return;
@@ -355,8 +356,8 @@ export class DiscordEventsBridge {
         const value = record?.value;
         if (!value || value.principal !== principal || value.event.data.author_id !== this.config.senderUserId
           || value.expires <= this.now() || value.event.data.conversation_id !== p.conversation_id
-          || !sub?.value.active || sub.value.principal !== principal || sub.value.authorizedUntil <= this.now()
-          || sub.value.audience !== this.config.audience || sub.value.expires <= this.now()
+          || !sub?.value.active || sub.value.principal !== principal || !deadlineActive(sub.value.authorizedUntil,this.now())
+          || sub.value.audience !== this.config.audience || !deadlineActive(sub.value.expires,this.now())
           || sub.value.generation !== value.generation || sub.value.authority !== value.authority || !await this.access(principal, value.authority) || value.delivery.attempts < 1) throw new BridgeError(-32024,"unknown_or_expired_message");
         if (value.reply) {
           if (value.reply.hash !== contentHash) throw new BridgeError(-32024,"reply_already_reserved");
@@ -383,8 +384,8 @@ export class DiscordEventsBridge {
             await this.authorize(principal, value.authority);
             const active=(await this.controls.get<Subscription>("subscription","dot"))?.value;
             if (!active?.active || active.principal !== principal || active.generation !== value.generation
-              || active.audience !== this.config.audience || active.expires <= this.now()
-              || active.authorizedUntil <= this.now() || value.expires <= this.now()) throw new BridgeError(-32024,"unknown_or_expired_message");
+              || active.audience !== this.config.audience || !deadlineActive(active.expires,this.now())
+              || !deadlineActive(active.authorizedUntil,this.now()) || value.expires <= this.now()) throw new BridgeError(-32024,"unknown_or_expired_message");
           });
           const id=snowflake.parse(await this.send(value.event.data.channel_id,p.message_id,p.texts[index]!,hash(`reply:${p.message_id}:${index}`).slice(0,24)));
           messageIds.push(id);
@@ -428,8 +429,8 @@ export class DiscordEventsBridge {
     const sub = (await this.controls.get<Subscription>("subscription", "dot"))?.value;
     const value = record?.value;
     if (!value || value.event.data.author_id !== this.config.senderUserId || value.principal !== principal || value.expires <= this.now() || value.event.data.conversation_id !== p.conversation_id
-      || value.delivery.attempts < 1 || !sub?.active || sub.audience !== this.config.audience || sub.expires <= this.now()
-      || sub.authorizedUntil <= this.now() || sub.generation !== value.generation || sub.authority !== value.authority || !await this.access(principal,value.authority) || sub.principal !== principal) {
+      || value.delivery.attempts < 1 || !sub?.active || sub.audience !== this.config.audience || !deadlineActive(sub.expires,this.now())
+      || !deadlineActive(sub.authorizedUntil,this.now()) || sub.generation !== value.generation || sub.authority !== value.authority || !await this.access(principal,value.authority) || sub.principal !== principal) {
       throw new BridgeError(-32024, "unknown_or_expired_message");
     }
     const attachment = value.event.data.attachments?.find(item => item.id === p.attachment_id);
@@ -498,7 +499,7 @@ export class DiscordEventsBridge {
       const sub = await this.controls.get<Subscription>("subscription", "dot");
       if (!anchor || anchor.value.event.data.author_id !== this.config.senderUserId || anchor.value.principal !== principal || anchor.value.expires <= this.now()
         || anchor.value.event.data.conversation_id !== p.conversation_id || !sub?.value.active
-        || sub.value.audience !== this.config.audience || sub.value.expires <= this.now() || sub.value.authorizedUntil <= this.now()
+        || sub.value.audience !== this.config.audience || !deadlineActive(sub.value.expires,this.now()) || !deadlineActive(sub.value.authorizedUntil,this.now())
         || anchor.value.generation !== sub.value.generation || anchor.value.authority !== sub.value.authority || !await this.access(principal,anchor.value.authority)) throw new BridgeError(-32024, "unknown_or_expired_message");
       if (anchor.value.timing && anchor.value.timing.firstToolAt === undefined) {
         anchor.value.timing.firstToolAt = requestedAt;
