@@ -63,7 +63,8 @@ export function parseConfig(input: unknown, enabled = false, authEnabled = false
     }
     if (authEnabled ? item.bearerFile !== undefined : !item.bearerFile || !item.callbackUrl) throw new Error("authentication_binding_mismatch");
     if (item.audience === "owner-dm" && item.senderId !== config.ownerUserId) throw new Error("owner_binding_mismatch");
-    if (item.authorizedUntil===null ? !authEnabled || item.audience!=="owner-dm" : Date.parse(item.authorizedUntil) <= Date.now()) throw new Error("expired_or_unsupported_consumer_authorization");
+    // Authentication-only startup may inspect expired authority; runtime grant checks still deny its use.
+    if (item.authorizedUntil===null ? !authEnabled || item.audience!=="owner-dm" : (enabled || !authEnabled) && Date.parse(item.authorizedUntil) <= Date.now()) throw new Error("expired_or_unsupported_consumer_authorization");
   }
   if (config.oauth && authEnabled) {
     if (config.bindings.some(item => item.audience !== "owner-dm" || item.senderId !== config.ownerUserId)) throw new Error("oauth_pilot_owner_dm_only");
